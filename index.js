@@ -301,8 +301,38 @@ client.on(Events.GuildMemberAdd, async (member) => {
   }
 });
 
-// Roda a cada minuto: remove cargos vencidos e envia avisos de renovação.
+// Marca o pedido como pago, estende a assinatura e entrega o cargo.
+async function fulfillOrder(order, transactionNsu) {
+  const expiresAt = settleOrder(order.order_nsu, order.user_id, transactionNsu);
+  if (!expiresAt) return; // já processado
+  const member = await grantRole(order.user_id);
+  if (member) {
+    await sendDM(
+      member,
+      `✅ Pagamento confirmado! Seu cargo VIP está ativo até **${fmtDate(expiresAt)}**.`
+    );
+  }
+}
+
+// Plano B sem webhook: consulta a InfinitePay sobre pedidos pendentes dos últimos 30 min.
+async function pollPendingOrders() {
+  const pending = db
+    .prepare("SELECT * FROM orders WHERE status = 'pending' AND created_at > ?")
+    .all(Date.now() - 30 * MINUTE);
+  for (const order of pending) {
+    try {
+      if (await isPaid({ orderNsu: order.order_nsu })) {
+        await fulfillOrder(order);
+      }
+    } catch (err) {
+      console.error('Erro ao verificar pedido', order.order_nsu, err);
+    }
+  }
+}
+
+// Roda a cada minuto: confirma pagamentos pendentes, remove cargos vencidos e envia avisos.
 async function checkSubscriptions() {
+  await pollPendingOrders();
   const now = Date.now();
 
   const expired = db
@@ -349,6 +379,10 @@ async function checkSubscriptions() {
 
 // ───────────────────────── Webhook (servidor HTTP) ─────────────────────────
 const app = express();
+app.use((req, _res, next) => {
+  if (req.path !== '/') console.log(`HTTP ${req.method} ${req.path}`);
+  next();
+});
 app.use(express.json());
 
 app.get('/', (_req, res) => res.send('ok'));
@@ -356,10 +390,12 @@ app.get('/', (_req, res) => res.send('ok'));
 app.post('/webhook/infinitepay', async (req, res) => {
   // O webhook da InfinitePay não é assinado: usamos um token secreto na URL
   // e, principalmente, confirmamos o pagamento direto na API deles.
-  if (req.query.token !== WEBHOOK_SECRET) return res.sendStatus(401);
-
   const body = req.body ?? {};
   console.log('webhook recebido:', JSON.stringify(body));
+  if (req.query.token !== WEBHOOK_SECRET) {
+    console.error('webhook com token inválido (confira WEBHOOK_SECRET)');
+    return res.sendStatus(401);
+  }
 
   const orderNsu = body.order_nsu;
   const order = orderNsu ? getOrder.get(orderNsu) : null;
@@ -389,16 +425,7 @@ app.post('/webhook/infinitepay', async (req, res) => {
       return res.status(400).json({ success: false, message: 'pagamento não confirmado' });
     }
 
-    const expiresAt = settleOrder(orderNsu, order.user_id, transactionNsu);
-    if (expiresAt) {
-      const member = await grantRole(order.user_id);
-      if (member) {
-        await sendDM(
-          member,
-          `✅ Pagamento confirmado! Seu cargo VIP está ativo até **${fmtDate(expiresAt)}**.`
-        );
-      }
-    }
+    await fulfillOrder(order, transactionNsu);
     return res.status(200).json({ success: true, message: null });
   } catch (err) {
     console.error('Erro no webhook:', err);
