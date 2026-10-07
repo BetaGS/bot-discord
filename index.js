@@ -130,6 +130,7 @@ async function createCheckoutLink(userId) {
       order_nsu: orderNsu,
       items: [{ quantity: 1, price: PRICE_CENTS, description: PRODUCT_NAME }],
       webhook_url: `${PUBLIC_URL}/webhook/infinitepay?token=${WEBHOOK_SECRET}`,
+      redirect_url: `${PUBLIC_URL}/pago`,
     }),
   });
   const data = await res.json().catch(() => ({}));
@@ -314,25 +315,8 @@ async function fulfillOrder(order, transactionNsu) {
   }
 }
 
-// Plano B sem webhook: consulta a InfinitePay sobre pedidos pendentes dos últimos 30 min.
-async function pollPendingOrders() {
-  const pending = db
-    .prepare("SELECT * FROM orders WHERE status = 'pending' AND created_at > ?")
-    .all(Date.now() - 30 * MINUTE);
-  for (const order of pending) {
-    try {
-      if (await isPaid({ orderNsu: order.order_nsu })) {
-        await fulfillOrder(order);
-      }
-    } catch (err) {
-      console.error('Erro ao verificar pedido', order.order_nsu, err);
-    }
-  }
-}
-
-// Roda a cada minuto: confirma pagamentos pendentes, remove cargos vencidos e envia avisos.
+// Roda a cada minuto: remove cargos vencidos e envia avisos de renovação.
 async function checkSubscriptions() {
-  await pollPendingOrders();
   const now = Date.now();
 
   const expired = db
@@ -431,6 +415,49 @@ app.post('/webhook/infinitepay', async (req, res) => {
     console.error('Erro no webhook:', err);
     // 400 faz a InfinitePay tentar de novo.
     return res.status(400).json({ success: false, message: 'erro ao processar' });
+  }
+});
+
+// Página para onde a InfinitePay devolve o cliente após o pagamento.
+// Ela traz order_nsu, transaction_nsu e slug, que permitem confirmar o pagamento na hora.
+const page = (title, msg) =>
+  `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">` +
+  `<meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>` +
+  `<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;` +
+  `background:#0f1115;color:#f2f2f2;font-family:system-ui,sans-serif;text-align:center;padding:24px}` +
+  `main{max-width:420px}h1{font-size:1.5rem}p{color:#b8bcc6;line-height:1.5}</style></head>` +
+  `<body><main><h1>${title}</h1><p>${msg}</p></main></body></html>`;
+
+app.get('/pago', async (req, res) => {
+  const { order_nsu: orderNsu, transaction_nsu: transactionNsu, slug } = req.query;
+  console.log('retorno do checkout:', JSON.stringify(req.query));
+
+  const order = typeof orderNsu === 'string' ? getOrder.get(orderNsu) : null;
+  if (!order) {
+    return res
+      .status(404)
+      .send(page('Pedido não encontrado', 'Volte ao Discord e gere um novo link com o botão Assinar VIP.'));
+  }
+
+  try {
+    if (order.status === 'paid') {
+      const sub = getSub.get(order.user_id);
+      if (sub && sub.active && sub.expires_at > Date.now()) await grantRole(order.user_id);
+    } else {
+      const paid = await isPaid({ orderNsu, transactionNsu, slug });
+      if (!paid) {
+        return res
+          .status(202)
+          .send(page('Confirmando pagamento…', 'Ainda não recebemos a confirmação. Aguarde alguns segundos e atualize esta página.'));
+      }
+      await fulfillOrder(order, transactionNsu);
+    }
+    return res.send(page('Pagamento confirmado ✅', 'Seu cargo VIP foi liberado. Você já pode voltar ao Discord.'));
+  } catch (err) {
+    console.error('Erro em /pago:', err);
+    return res
+      .status(500)
+      .send(page('Algo deu errado', 'Seu pagamento foi recebido, mas não conseguimos liberar o cargo agora. Atualize a página ou fale com o suporte.'));
   }
 });
 
