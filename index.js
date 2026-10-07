@@ -232,6 +232,11 @@ const commands = [
 client.once(Events.ClientReady, async (c) => {
   console.log(`Bot online como ${c.user.tag}`);
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  if (env.CLEAR_GLOBAL_COMMANDS === 'true') {
+    // Apaga comandos globais antigos (de um bot anterior no mesmo aplicativo)
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: [] });
+    console.log('Comandos globais antigos apagados.');
+  }
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
   console.log('Comandos registrados.');
   checkSubscriptions();
@@ -275,6 +280,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   } catch (err) {
     console.error('Erro na interação:', err);
+    const msg = `Erro: ${err.message ?? err}. Verifique se o bot tem permissão de ver e enviar mensagens/embeds neste canal.`;
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: msg, components: [] });
+      } else {
+        await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
+      }
+    } catch {
+      /* já expirou */
+    }
   }
 });
 
@@ -352,7 +367,18 @@ app.post('/webhook/infinitepay', async (req, res) => {
     return res.status(400).json({ success: false, message: 'pedido desconhecido' });
   }
   if (order.status === 'paid') {
-    return res.status(200).json({ success: true, message: null });
+    // Pedido já registrado como pago: garante que o cargo foi entregue
+    // (caso a tentativa anterior tenha falhado ao dar o cargo).
+    try {
+      const sub = getSub.get(order.user_id);
+      if (sub && sub.active && sub.expires_at > Date.now()) {
+        await grantRole(order.user_id);
+      }
+      return res.status(200).json({ success: true, message: null });
+    } catch (err) {
+      console.error('Erro ao entregar cargo (pedido já pago):', err);
+      return res.status(400).json({ success: false, message: 'erro ao dar cargo' });
+    }
   }
 
   try {
